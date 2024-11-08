@@ -47,6 +47,7 @@ const FILE_SIGNATURES: LazyLock<Vec<(&str, Box<dyn SizeRange>, &[u8], Footer)>> 
     ("html", Box::new(..=10_000_000usize), b"<!DOCTYPE html", Footer::Inclusive(b"</html>")), // HTML
     ("pdf", Box::new(..=10_000_000usize), b"%PDF-", Footer::Inclusive(b"%%EOF")), // PDF
     ("rtf", Box::new(..=10_000_000usize), b"{\\rtf1", Footer::Inclusive(b"}")), // RTF
+    // TODO: search for words to guess a .txt?
 
     // Image files
     // TODO: BMP could have less false positives if regexes were used?
@@ -69,67 +70,93 @@ const FILE_SIGNATURES: LazyLock<Vec<(&str, Box<dyn SizeRange>, &[u8], Footer)>> 
     ("wav", Box::new(..=10_000_000usize), b"RIFF\x00\x00\x00WAVE", Footer::None), // WAV
 ]);
 
-#[derive(Parser)]
-struct CliArgs {
-    /// Input .img/.dd/.raw file
-    #[arg(long)]
-    input_file: String,
+fn carve_slice(slice: &[u8]) -> Vec<(usize, usize, usize)> {
+    let mut results = Vec::new();
 
-    /// Directory to save recovered files to
-    #[arg(long)]
-    output_directory: String,
-}
-
-/// NOTE: does not read FAT/recover allocated files
-fn main() -> io::Result<()> {
-    let cli_args = CliArgs::parse();
-
-    // Create output directory
-    std::fs::create_dir_all(&cli_args.output_directory)?;
-
-    // Read the entire input file into memory
-    // TODO: would memory mapping be beneficial here?
-    let mut file = File::open(&cli_args.input_file)?;
-    let mut file_data = Vec::new();
-    file.read_to_end(&mut file_data)?;
-
-    let file_size = file_data.len();
-
-    // Check for each signature in the loaded file data
-    for (idx, (extension, size_range, header, footer)) in FILE_SIGNATURES.iter().enumerate() {
-        for pos in (0..file_size - header.len())
-                .filter(|ii| file_data[(*ii)..*ii + header.len()] == **header)
+    for (idx, (_ext, size_range, header, footer)) in FILE_SIGNATURES.iter().enumerate() {
+        for pos in (0..slice.len() - header.len())
+            .filter(|ii| slice[(*ii)..*ii + header.len()] == **header)
         {
-            println!("Found {} signature at offset {}", extension, pos);
-
-            let file_name = format!("{}/recovered_{}_{}.{}", cli_args.output_directory, pos, idx, extension);
-            let mut output_file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(file_name)?;
-
             // Check for footer in the remaining data
-            let footer_signature_pos = match footer {
+            let file_size = match footer {
                 Footer::Inclusive(f) | Footer::Exclusive(f) => Some(f),
                 Footer::None => None,
-            }.and_then(|e| find_signature(&file_data[(pos+header.len())..file_size], e));
-
-            if let Some(footer_pos) = footer_signature_pos {
-                output_file.write_all(&file_data[pos..pos + footer_pos + footer.file_size_after_footer_pos()])?;
-            } else {
-                output_file.write_all(&file_data[pos..pos + size_range.max()])?;
             }
+                .and_then(|f| find_static_signature(&slice[(pos+header.len())..slice.len()], f))
+                .map(|pos| header.len() + pos + footer.file_size_after_footer_pos())
+                .unwrap_or(size_range.max().min(slice.len()));
+
+            results.push((idx, pos, file_size));
         }
     }
 
-    Ok(())
+    results
 }
-
-fn find_signature(buffer: &[u8], signature: &[u8]) -> Option<usize> {
+fn find_static_signature(buffer: &[u8], signature: &[u8]) -> Option<usize> {
     for ii in 0..buffer.len() - signature.len() {
         if &buffer[ii..ii + signature.len()] == signature {
             return Some(ii);
         }
     }
     None
+}
+
+/// NOTE: This function does not read FAT or similar sources of information.
+/// That means that files may be undiscovered by the carving algorithm even if they are not actually deleted.
+fn carve_file(input_file: &str, output_directory: &str) -> io::Result<()> {
+    // Create output directory
+    std::fs::create_dir_all(output_directory)?;
+
+    // Read the entire input file into memory
+    // TODO: would memory mapping be beneficial here?
+    let mut file = File::open(input_file)?;
+    let mut file_data = Vec::new();
+    file.read_to_end(&mut file_data)?;
+
+    // Check for each signature in the loaded file data
+    for (file_type_index, start, size) in carve_slice(&file_data) {
+        let file_type = &(*FILE_SIGNATURES)[file_type_index];
+        println!("Found {} signature at offset {} (size {} B)", file_type.0, start, size);
+
+        let file_name = format!("{}/recovered_{}_{}.{}", output_directory, start, file_type_index, file_type.0);
+        let mut output_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(file_name)?;
+        output_file.write_all(&file_data[start..start+size])?;
+    }
+
+    Ok(())
+}
+
+#[derive(Parser)]
+struct CliArgs {
+    /// Input .img/.dd/.raw file
+    #[arg(long)]
+    input_file: Option<String>,
+
+    /// Input location to be scanned for deleted files
+    #[arg(long)]
+    input_location: Option<String>,
+
+    /// Directory to save recovered files to
+    #[arg(long)]
+    output_directory: String,
+}
+
+fn main() -> io::Result<()> {
+    let cli_args = CliArgs::parse();
+
+    if cli_args.input_file.is_some() == cli_args.input_location.is_some() {
+        eprintln!("Error: Exactly one of the input source arguments must be provided");
+        std::process::exit(1);
+    }
+
+    if let Some(input_file) = cli_args.input_file {
+        carve_file(&input_file, &cli_args.output_directory)?;
+    } else if let Some(_input_location) = cli_args.input_location {
+        // TODO: carve a location
+    }
+
+    Ok(())
 }
